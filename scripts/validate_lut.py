@@ -22,16 +22,13 @@ def test_query(num_tests: int = 20):
         h_target = float(np.random.uniform(-0.1, 0.2))
         v0_query = float(np.random.uniform(23, 25))  # 使用你的v0范围
 
-        theta_pred_deg, error, flight_time = lut.query(d_target, h_target, v0_query)
+        theta_pred_deg, error, flight_time = lut.query(d_target, h_target, v0_query, error_threshold=0.1, use_theta_refine=True, debug=False)
 
         errors.append(error)
         flight_times.append(flight_time)
 
-        print(f"测试 {i + 1:2d}: d={d_target:6.2f}m, h={h_target:5.2f}m, v₀={v0_query:6.2f} m/s "
-              f"=> θ={theta_pred_deg:6.1f}°, 误差={error * 1000:6.1f}mm, 飞行时间={flight_time:.3f}s")
-
-        print(f"测试 {i + 1:2d}: d={d_target:6.2f}m, h={h_target:5.2f}m, v₀={v0_query:6.2f} m/s "
-              f"=> θ={theta_pred_deg:6.1f}°, 误差={error * 1000:6.1f}mm, 飞行时间={flight_time:.3f}s")
+        print(f"测试 {i + 1:2d}: d={d_target:6.3f}m, h={h_target:5.3f}m, v₀={v0_query:6.3f} m/s "
+              f"=> θ={theta_pred_deg:6.3f}°, 误差={error * 1000:6.1f}mm, 飞行时间={flight_time*1000:.1f}ms")
 
     errors = np.array(errors) * 1000  # 转为mm
     flight_times = np.array(flight_times)
@@ -58,7 +55,7 @@ def test_performance(num_queries: int = 1000):
 
     d_targets = np.random.uniform(5, 25, num_queries)
     h_targets = np.random.uniform(-1, 5, num_queries)
-    v0_queries = np.random.uniform(10, 30, num_queries)
+    v0_queries = np.random.uniform(23, 25, num_queries)
 
     start_time = time.time()
     for d_t, h_t, v0 in zip(d_targets, h_targets, v0_queries):
