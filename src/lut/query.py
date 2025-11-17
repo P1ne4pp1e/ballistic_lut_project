@@ -13,12 +13,29 @@ class TrajectoryLUT:
 
         self.f = h5py.File(lut_path, 'r')
 
-        # 读取元数据
+        # 读取元数据 - 明确转换numpy标量到Python类型
         self.v0_list = np.array(self.f['v0_list'])
         self.theta_list = np.array(self.f['theta_list'])
+
+        # HDF5 attrs返回numpy标量,需要用item()提取
         self.n_v0 = int(self.f.attrs['n_v0'])
         self.n_theta = int(self.f.attrs['n_theta'])
         self.dv0 = float(self.f.attrs['dv0'])
+        self.v0_min = float(self.f.attrs['v0_min'])
+
+        # print(f"DEBUG: n_v0={self.n_v0} (type={type(self.n_v0)})")
+        # print(f"DEBUG: dv0={self.dv0} (type={type(self.dv0)})")
+        # print(f"DEBUG: v0_min={self.v0_min} (type={type(self.v0_min)})")
+
+        # 检查完整性
+        expected_trajectories = self.n_v0 * self.n_theta
+        actual_trajectories = len(self.f['trajectories'].keys())
+
+        if actual_trajectories != expected_trajectories:
+            print(f"⚠ 警告: 查表不完整!")
+            print(f"  预期: {expected_trajectories:,} 条轨迹")
+            print(f"  实际: {actual_trajectories:,} 条轨迹")
+            print(f"  建议重新生成查表: python scripts/generate_lut.py\n")
 
         # 缓存轨迹
         self.trajectories = {}
@@ -43,14 +60,28 @@ class TrajectoryLUT:
         print(f"✓ 查表加载完成！耗时 {elapsed:.1f}s\n")
 
     def _find_v0_index(self, v0):
-        """找到v0最近的索引"""
-        idx = np.round((v0 - self.v0_list[0]) / self.dv0).astype(int)
+        """找到v0最近的索引 - 返回标量int"""
+        # DEBUG
+        # print(f"  v0={v0} (type={type(v0)}, shape={getattr(v0, 'shape', 'N/A')})")
+        # print(f"  v0_min={self.v0_min} (type={type(self.v0_min)})")
+        # print(f"  dv0={self.dv0} (type={type(self.dv0)})")
+
+        # 计算索引
+        idx = (v0 - self.v0_min) / self.dv0
+        # print(f"  raw idx={idx} (type={type(idx)}, shape={getattr(idx, 'shape', 'N/A')})")
+
+        idx = np.round(idx)
+        # print(f"  rounded idx={idx} (type={type(idx)}, shape={getattr(idx, 'shape', 'N/A')})")
+
         idx = np.clip(idx, 0, self.n_v0 - 1)
-        return idx
+        # print(f"  clipped idx={idx} (type={type(idx)}, shape={getattr(idx, 'shape', 'N/A')})")
+
+        # 转为Python int
+        return int(idx)
 
     def _distance_to_trajectory(self, points, d_target, h_target):
         """计算目标点到轨迹的最小距离"""
-        distances = np.sqrt((points[:, 0] - d_target)**2 + (points[:, 1] - h_target)**2)
+        distances = np.sqrt((points[:, 0] - d_target) ** 2 + (points[:, 1] - h_target) ** 2)
         min_dist = np.min(distances)
         min_idx = np.argmin(distances)
         return min_dist, points[min_idx]
@@ -70,11 +101,6 @@ class TrajectoryLUT:
             theta_deg: 最优仰角 (度)
             error_m: 预测误差 (m)
             flight_time: 飞行时间 (s)
-
-        示例:
-            >>> theta, error, t_flight = lut.query(20.0, 2.5, 21.5)
-            >>> print(f"仰角: {theta:.1f}°, 误差: {error*1000:.1f}mm, 飞行时间: {t_flight:.3f}s")
-            仰角: 24.5°, 误差: 1.2mm, 飞行时间: 2.345s
         """
         i_v = self._find_v0_index(v0)
 
@@ -106,8 +132,7 @@ class TrajectoryLUT:
         valid_candidates = [c for c in candidates if c['error'] < 0.05]
 
         if not valid_candidates:
-            print(f"警告：目标超出射程或无有效解")
-            print(f"最近的候选：θ={candidates[0]['theta_deg']:.1f}°, 误差={candidates[0]['error']:.3f}m")
+            # 无有效解,返回最近的
             best = candidates[0]
         else:
             # 在有效候选中选择pitch最小的
@@ -128,14 +153,9 @@ class TrajectoryLUT:
 
         Returns:
             flight_time: 飞行时间 (s)
-
-        示例:
-            >>> t = lut.get_time_at_distance(25.0, 21.0, 15.0)
-            >>> print(f"到达15m的飞行时间: {t:.3f}s")
-            到达15m的飞行时间: 0.847s
         """
-        i_v = np.clip(int(np.round((v0 - self.v0_list[0]) / self.dv0)), 0, self.n_v0 - 1)
-        i_theta = np.argmin(np.abs(self.theta_list - theta_deg))
+        i_v = self._find_v0_index(v0)
+        i_theta = int(np.argmin(np.abs(self.theta_list - theta_deg)))
 
         key = f'{i_v:04d}_{i_theta:04d}'
         traj_data = self.trajectories[key]
@@ -157,8 +177,8 @@ class TrajectoryLUT:
             return times[-1]
 
         # 线性插值
-        d0, d1 = distances[idx-1], distances[idx]
-        t0, t1 = times[idx-1], times[idx]
+        d0, d1 = distances[idx - 1], distances[idx]
+        t0, t1 = times[idx - 1], times[idx]
 
         t_query = t0 + (d_query - d0) / (d1 - d0) * (t1 - t0)
         return t_query

@@ -1,8 +1,7 @@
-"""配置管理"""
+"""配置管理 - 修复版"""
 
 import numpy as np
 from dataclasses import dataclass
-from typing import Tuple
 import yaml
 from pathlib import Path
 
@@ -12,13 +11,13 @@ class PhysicsConfig:
     """物理参数配置"""
 
     # 球体参数
-    radius: float = 0.0085  # 17mm弹丸
-    mass: float = 0.005  # 5g
+    radius: float = 0.0085
+    mass: float = 0.005
 
     # 环境参数
-    g: float = 9.8  # 重力加速度
-    rho: float = 1.2  # 空气密度
-    cd: float = 0.47  # 阻力系数
+    g: float = 9.8
+    rho: float = 1.2
+    cd: float = 0.47
 
     def __post_init__(self):
         """计算派生参数"""
@@ -28,29 +27,63 @@ class PhysicsConfig:
     def __repr__(self) -> str:
         return (f"PhysicsConfig(\n"
                 f"  radius={self.radius * 1000:.1f}mm, mass={self.mass * 1000:.1f}g\n"
-                f"  g={self.g:.1f}m/s², rho={self.rho:.2f}kg/m³\n"
+                f"  g={self.g:.2f}m/s², rho={self.rho:.2f}kg/m³\n"
                 f"  cd={self.cd:.2f}, k={self.k:.6f}s⁻¹\n"
                 f")")
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str = 'config.yaml') -> 'PhysicsConfig':
+        """从YAML文件加载配置"""
+        # 自动查找项目根目录的config.yaml
+        if not Path(yaml_path).is_absolute():
+            # 尝试多个可能的路径
+            candidates = [
+                Path(yaml_path),  # 当前目录
+                Path(__file__).parent.parent.parent / yaml_path,  # 项目根目录
+                Path.cwd() / yaml_path,  # 工作目录
+            ]
+
+            yaml_path_obj = None
+            for candidate in candidates:
+                if candidate.exists():
+                    yaml_path_obj = candidate
+                    break
+
+            if yaml_path_obj is None:
+                print(f"警告: 无法找到 {yaml_path},使用默认配置")
+                return cls()
+
+            yaml_path = str(yaml_path_obj)
+
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            config_data = yaml.safe_load(f)
+
+        if 'physics' not in config_data:
+            print("警告: YAML中缺少physics配置,使用默认值")
+            return cls()
+
+        physics_data = config_data['physics']
+        return cls(**physics_data)
 
 
 @dataclass
 class LUTConfig:
     """查表配置"""
 
-    # 速度参数：10~30 m/s，间隔0.05
+    # 速度参数
     v0_min: float = 10.0
     v0_max: float = 30.0
     dv0: float = 0.05
 
-    # 角度参数：-10°~60°，间隔0.1°
+    # 角度参数
     theta_min: float = -10.0
     theta_max: float = 60.0
     dtheta: float = 0.1
 
     # 数值求解参数
-    dt: float = 0.0001  # RK4时间步长
-    max_time: float = 5.0  # 最大飞行时间
-    distance_sample_interval: float = 0.1  # 采样点间隔
+    dt: float = 0.0001
+    max_time: float = 5.0
+    distance_sample_interval: float = 0.1
 
     def __post_init__(self):
         """计算派生参数"""
@@ -70,8 +103,34 @@ class LUTConfig:
                 f")")
 
     @classmethod
-    def from_yaml(cls, yaml_path: str) -> 'LUTConfig':
+    def from_yaml(cls, yaml_path: str = 'config.yaml') -> 'LUTConfig':
         """从YAML文件加载配置"""
-        with open(yaml_path, 'r') as f:
-            data = yaml.safe_load(f)['lut']
-        return cls(**data)
+        # 自动查找项目根目录的config.yaml
+        if not Path(yaml_path).is_absolute():
+            candidates = [
+                Path(yaml_path),
+                Path(__file__).parent.parent.parent / yaml_path,
+                Path.cwd() / yaml_path,
+            ]
+
+            yaml_path_obj = None
+            for candidate in candidates:
+                if candidate.exists():
+                    yaml_path_obj = candidate
+                    break
+
+            if yaml_path_obj is None:
+                print(f"警告: 无法找到 {yaml_path},使用默认配置")
+                return cls()
+
+            yaml_path = str(yaml_path_obj)
+
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            config_data = yaml.safe_load(f)
+
+        if 'lut' not in config_data:
+            print("警告: YAML中缺少lut配置,使用默认值")
+            return cls()
+
+        lut_data = config_data['lut']
+        return cls(**lut_data)

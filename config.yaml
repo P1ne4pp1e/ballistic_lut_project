@@ -1,28 +1,28 @@
 physics:
   # 球体参数
   radius: 0.0085      # 17mm弹丸半径 (m)
-  mass: 0.005         # 5g弹丸质量 (kg)
+  mass: 0.0032         # 3.2g弹丸质量 (kg)
 
   # 环境参数
-  g: 9.8              # 重力加速度 (m/s²)
+  g: 9.81              # 重力加速度 (m/s²)
   rho: 1.2            # 空气密度 (kg/m³)，20°C海平面
   cd: 0.47            # 光滑球体阻力系数
 
 lut:
-  # 速度参数：10~30 m/s，间隔0.05 m/s
-  v0_min: 10.0
-  v0_max: 30.0
-  dv0: 0.05
+  # 速度参数：v0_min ~ v0_max m/s，间隔 dv0 m/s
+  v0_min: 23.0
+  v0_max: 25.0
+  dv0: 0.1
 
-  # 角度参数：-10°~60°，间隔0.1°
-  theta_min: -10.0
-  theta_max: 60.0
+  # 角度参数：theta_min° ~ theta_max°，间隔 dtheta°
+  theta_min: -30.0
+  theta_max: 30.0
   dtheta: 0.1
 
   # 数值求解参数
   dt: 0.0001          # RK4时间步长 (s)
-  max_time: 5.0       # 最大飞行时间 (s)
-  distance_sample_interval: 0.1  # 采样点间隔 (m)
+  max_time: 0.5       # 最大飞行时间 (s)
+  distance_sample_interval: 0.01  # 采样点间隔 (m)
 
 storage:
   # 查表存储配置
