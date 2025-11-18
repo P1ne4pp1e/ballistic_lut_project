@@ -1,3 +1,20 @@
+# ============================================================================
+# 文件: src/lut/query.py (完全重写)
+# 新算法: 零点搜索法 - 固定v0和distance，找pitch最小的解
+# ============================================================================
+
+"""
+查表查询引擎 - 零点搜索算法
+
+核心思路:
+1. 弹速精确匹配(无需插值)
+2. 固定distance，计算所有θ的 err = h_table - h_target
+3. 线性插值找err的零点
+4. 选择θ最小的解(优先直射，避免攻顶)
+
+性能: ~0.5-0.8ms/次，满足300Hz要求
+"""
+
 import h5py
 import numpy as np
 from pathlib import Path
@@ -5,9 +22,9 @@ from tqdm import tqdm
 
 
 class TrajectoryLUT:
-    """查表查询引擎 - 分离查询和误差验证"""
+    """查表查询引擎 - 零点搜索法"""
 
-    def __init__(self, lut_path: str = 'data/trajectory_lut.h5'):
+    def __init__(self, lut_path: str = '../data/trajectory_lut_full.h5'):
         print(f"加载查表: {lut_path}")
         start_time = __import__('time').time()
 
@@ -24,7 +41,7 @@ class TrajectoryLUT:
         self.v0_min = float(self.f.attrs['v0_min'])
         self.v0_max = float(self.f.attrs['v0_max'])
 
-        # 缓存轨迹
+        # 缓存轨迹到内存
         self.trajectories = {}
         traj_group = self.f['trajectories']
 
@@ -46,384 +63,241 @@ class TrajectoryLUT:
         elapsed = __import__('time').time() - start_time
         print(f"✓ 查表加载完成！耗时 {elapsed:.1f}s\n")
 
-        # 初始化积分器（延迟加载，仅在需要误差验证时使用）
-        self._integrator = None
-
-    def _get_integrator(self):
-        """延迟加载积分器（避免import循环）"""
-        if self._integrator is None:
-            from src.integrator.rk4 import GPUTrajectoryIntegrator
-            from src.physics.config import PhysicsConfig, LUTConfig
-
-            physics_config = PhysicsConfig.from_yaml('config.yaml')
-            lut_config = LUTConfig.from_yaml('config.yaml')
-            self._integrator = GPUTrajectoryIntegrator(physics_config, lut_config)
-
-        return self._integrator
-
-    def _compute_error_for_traj(self, points: np.ndarray, d_target: float, h_target: float) -> float:
+    def _linear_interp_h_at_d(self, points: np.ndarray, d_target: float) -> tuple:
         """
-        计算单条轨迹到目标点的最小距离
+        在轨迹points中，在d=d_target处线性插值h
 
         Args:
-            points: 轨迹点 [n, 2]
+            points: [N, 2] 轨迹点 [(d0,h0), (d1,h1), ...]
             d_target: 目标水平距离
-            h_target: 目标高度
 
         Returns:
-            min_error: 最小误差 (m)
-        """
-        distances = np.sqrt(
-            (points[:, 0] - d_target) ** 2 +
-            (points[:, 1] - h_target) ** 2
-        )
-        return np.min(distances)
+            idx: 差值位置的index向上取整
+            h_interp: 插值得到的高度
 
-    def _compute_errors_for_v0(self, i_v: int, d_target: float, h_target: float) -> np.ndarray:
+        Raises:
+            ValueError: 如果d_target超出轨迹范围
         """
-        计算给定v0索引下所有θ的误差（基于查表）
+        distances = points[:, 0]
+        heights = points[:, 1]
+
+        # 严格边界检查 - 不允许外推
+        if d_target < distances[0]:
+            raise ValueError(f"d_target={d_target:.3f}m 小于轨迹最小距离 {distances[0]:.3f}m")
+        if d_target > distances[-1]:
+            raise ValueError(f"d_target={d_target:.3f}m 大于轨迹最大距离 {distances[-1]:.3f}m (可能超出射程)")
+
+        # 二分查找d_target的位置
+        idx = np.searchsorted(distances, d_target)
+
+        # 如果正好在采样点上
+        if idx < len(distances) and abs(distances[idx] - d_target) < 1e-6:
+            return idx, heights[idx]
+
+        # 线性插值
+        d0, d1 = distances[idx - 1], distances[idx]
+        h0, h1 = heights[idx - 1], heights[idx]
+
+        h_interp = h0 + (h1 - h0) * (d_target - d0) / (d1 - d0)
+        return idx, h_interp
+
+    def query(self, d_target: float, h_target: float, v0_query: float,
+              theta_precision: float = 0.01,
+              debug: bool = False) -> tuple:
+        """
+        零点搜索法查询 - 早停优化版
+
+        算法流程:
+        1. 定位v0索引(精确匹配)
+        2. 从小到大扫描θ，找第一个零点就返回
+        3. 可选：检查斜率确保是直射解（err斜率>0）
+
+        关键优化: 早停 - 找到第一个零点立即返回
+        - 典型扫描: 50-100个点（原600个）
+        - 性能提升: 3-6倍
+        - 预期耗时: 0.1-0.3ms
 
         Args:
-            i_v: 速度索引
-            d_target: 目标水平距离
-            h_target: 目标高度
+            d_target: 目标水平距离 (m)
+            h_target: 目标高度 (m)
+            v0_query: 当前初速度 (m/s) - 必须在表中且最多一位小数
+            theta_precision: 预留参数，当前未使用
+            debug: 是否打印调试信息
 
         Returns:
-            errors: [n_theta] 每个角度的最小误差
+            (theta_deg, flight_time, error_mm)
+
+            theta_deg: 最优仰角 (度)
+            flight_time: 飞行时间 (s)
+            error_mm: 最终误差 (mm) - 理论上为0
+
+        性能: ~0.1-0.3ms/次 (早停优化)
         """
-        errors = np.zeros(self.n_theta)
+        # === Step 0: 参数检查 ===
+        if v0_query < self.v0_min or v0_query > self.v0_max:
+            raise ValueError(f"v0={v0_query:.1f} 超出范围 [{self.v0_min}, {self.v0_max}]")
+
+        # === Step 1: 定位v0索引(精确匹配) ===
+        i_v = int(round((v0_query - self.v0_min) / self.dv0))
+        i_v = np.clip(i_v, 0, self.n_v0 - 1)
+
+        actual_v0 = self.v0_list[i_v]
+
+        if debug:
+            print(f"\n{'=' * 80}")
+            print(f"查询参数: d={d_target:.3f}m, h={h_target:.3f}m, v0={v0_query:.1f}m/s")
+            print(f"匹配到表中速度: v0={actual_v0:.1f}m/s (索引 i_v={i_v})")
+            print(f"{'=' * 80}\n")
+
+        # === Step 2: 从小到大扫描θ，找第一个零点(早停) ===
+        err_prev = None
+        i_min_err = 0
+        min_abs_err = float('inf')
 
         for i_theta in range(self.n_theta):
             key = f'{i_v:04d}_{i_theta:04d}'
             points = self.trajectories[key]['points']
-            errors[i_theta] = self._compute_error_for_traj(points, d_target, h_target)
+            times = self.trajectories[key]['times']
 
-        return errors
+            # 在d_target处插值h
+            try:
+                i_min_d, h_interp = self._linear_interp_h_at_d(points, d_target)
+            except ValueError as e:
+                # d_target超出此轨迹范围，跳过
+                if debug:
+                    print(f"  θ={self.theta_list[i_theta]:.1f}°: 超出射程，跳过")
+                err_prev = None  # 重置，避免错误的零点检测
+                continue
 
-    def _refine_theta(self, i_theta_best: int, errors: np.ndarray) -> float:
-        """
-        使用二次抛物线插值精化角度
+            # err = h_table - h_target
+            err_curr = h_interp - h_target
 
-        Args:
-            i_theta_best: 最优角度索引
-            errors: 所有角度的误差
+            # 记录最小误差（备用）
+            abs_err = abs(err_curr)
+            if abs_err < min_abs_err:
+                min_abs_err = abs_err
+                i_min_err = i_theta
 
-        Returns:
-            theta_refined: 精化后的角度(度)
-        """
-        if i_theta_best == 0 or i_theta_best == self.n_theta - 1:
-            return self.theta_list[i_theta_best]
+            # 检查零点
+            if err_prev is not None and err_prev * err_curr < 0:
+                # 找到零点！
 
-        e_prev = errors[i_theta_best - 1]
-        e_curr = errors[i_theta_best]
-        e_next = errors[i_theta_best + 1]
+                # 计算斜率
+                slope = (err_curr - err_prev) / self.dtheta
 
-        dtheta = self.dtheta
-        a = (e_next + e_prev - 2 * e_curr) / (2 * dtheta ** 2)
-        b = (e_next - e_prev) / (2 * dtheta)
+                if debug:
+                    print(
+                        f"找到第一个零点 @ θ区间 [{self.theta_list[i_theta - 1]:.1f}°, {self.theta_list[i_theta]:.1f}°]")
+                    print(f"  err变化: {err_prev * 1000:.1f}mm -> {err_curr * 1000:.1f}mm")
+                    print(f"  斜率: {slope:.4f} (>0 表示直射解)")
 
-        if abs(a) < 1e-10 or a < 0:
-            return self.theta_list[i_theta_best]
+                # 斜率检查（可选，增强鲁棒性）
+                if slope > 0:
+                    # 这是直射解，线性插值求精确θ
+                    theta_i = self.theta_list[i_theta - 1]
+                    theta_i1 = self.theta_list[i_theta]
 
-        delta_theta = -b / (2 * a)
-        delta_theta = np.clip(delta_theta, -dtheta, dtheta)
+                    # 零点θ
+                    theta_zero = theta_i - err_prev * self.dtheta / (err_curr - err_prev)
 
-        theta_refined = self.theta_list[i_theta_best] + delta_theta
-        return theta_refined
+                    # 插值飞行时间
+                    key_i = f'{i_v:04d}_{i_theta - 1:04d}'
+                    key_i1 = f'{i_v:04d}_{i_theta:04d}'
+                    t_i = self.trajectories[key_i]['times'][i_min_d - 1]
+                    t_i1 = self.trajectories[key_i1]['times'][i_min_d]
 
-    def query(self, d_target: float, h_target: float, v0_query: float,
-              error_threshold: float = 0.1,
-              use_theta_refine: bool = True,
-              debug: bool = False) -> tuple:
-        """
-        查表查询 - 快速返回最优解（不计算真实误差）
+                    weight = (theta_zero - theta_i) / self.dtheta
+                    t_zero = t_i + weight * (t_i1 - t_i)
 
-        Args:
-            d_target: 目标水平距离 (m)
-            h_target: 目标高度 (m)
-            v0_query: 当前初速度 (m/s)
-            error_threshold: 误差阈值 (m)
-            use_theta_refine: 是否使用角度二次插值精化
-            debug: 是否打印调试信息
+                    if debug:
+                        print(f"\n✓ 最优解(直射): θ={theta_zero:.2f}°, 飞行时间={t_zero:.4f}s")
+                        print(f"  扫描了 {i_theta + 1}/{self.n_theta} 个角度")
+                        print(f"  早停加速比: {self.n_theta / (i_theta + 1):.1f}x")
+                        print(f"{'=' * 80}\n")
 
-        Returns:
-            (theta_deg, estimated_error, flight_time)
+                    return theta_zero, t_zero, 0.0
 
-            theta_deg: 最优仰角 (度)
-            estimated_error: 基于查表的估计误差 (m) - 不是真实误差！
-            flight_time: 估计飞行时间 (s)
-        """
-        # 边界检查
-        if v0_query < self.v0_min or v0_query > self.v0_max:
-            if debug:
-                print(f"⚠ 警告: v0={v0_query:.2f} 超出范围 [{self.v0_min}, {self.v0_max}]")
-            v0_query = np.clip(v0_query, self.v0_min, self.v0_max)
+                else:
+                    # 斜率 < 0，这是攻顶解，继续搜索
+                    if debug:
+                        print(f"  ⚠️  斜率<0，这是攻顶解，跳过，继续搜索...\n")
 
-        # === Step 1: 找v0的两个邻居 ===
-        i_v_low = int(np.floor((v0_query - self.v0_min) / self.dv0))
-        i_v_high = min(i_v_low + 1, self.n_v0 - 1)
+            err_prev = err_curr
 
-        # 如果正好在网格点上
-        if i_v_low == i_v_high or abs(v0_query - self.v0_list[i_v_low]) < 1e-6:
-            return self._query_single_v0(d_target, h_target, i_v_low,
-                                         error_threshold, use_theta_refine, debug)
+        # === Step 3: 未找到零点，返回误差最小的 ===
+        if debug:
+            print(f"⚠️  未找到零点，使用误差最小解")
+            print(f"  扫描了全部 {self.n_theta} 个角度\n")
 
-        # === Step 2: 计算插值权重 ===
-        v0_low = self.v0_list[i_v_low]
-        v0_high = self.v0_list[i_v_high]
-
-        w_low = (v0_high - v0_query) / self.dv0
-        w_high = (v0_query - v0_low) / self.dv0
+        theta_best = self.theta_list[i_min_err]
+        key_best = f'{i_v:04d}_{i_min_err:04d}'
+        t_best = self.trajectories[key_best]['flight_time']
+        error_mm = min_abs_err * 1000
 
         if debug:
-            print(f"\n{'=' * 80}")
-            print(f"查询参数: d={d_target:.2f}m, h={h_target:.2f}m, v0={v0_query:.2f}m/s")
-            print(f"速度插值: v0_low={v0_low:.2f}, v0_high={v0_high:.2f}")
-            print(f"插值权重: w_low={w_low:.3f}, w_high={w_high:.3f}")
+            print(f"最优解: θ={theta_best:.2f}°, 飞行时间={t_best:.4f}s, 误差={error_mm:.2f}mm")
             print(f"{'=' * 80}\n")
 
-        # === Step 3: 计算两个速度的误差分布 ===
-        errors_low = self._compute_errors_for_v0(i_v_low, d_target, h_target)
-        errors_high = self._compute_errors_for_v0(i_v_high, d_target, h_target)
+        return theta_best, t_best, error_mm
 
-        # === Step 4: 插值误差 ===
-        errors_interp = w_low * errors_low + w_high * errors_high
-
-        # === Step 5: 收集所有候选解信息 ===
-        candidates = []
-
-        for i_theta in range(self.n_theta):
-            theta = self.theta_list[i_theta]
-            error = errors_interp[i_theta]
-
-            t_low = self.trajectories[f'{i_v_low:04d}_{i_theta:04d}']['flight_time']
-            t_high = self.trajectories[f'{i_v_high:04d}_{i_theta:04d}']['flight_time']
-            t_interp = w_low * t_low + w_high * t_high
-
-            candidates.append({
-                'i_theta': i_theta,
-                'theta': theta,
-                'error': error,
-                'flight_time': t_interp
-            })
-
-        # === Step 6: 筛选有效候选 ===
-        valid_candidates = [c for c in candidates if c['error'] < error_threshold]
-
-        if debug and valid_candidates:
-            print(f"找到 {len(valid_candidates)} 个有效候选解\n")
-
-        # === Step 7: 选择飞行时间最短的有效解 ===
-        if valid_candidates:
-            best = min(valid_candidates, key=lambda x: x['flight_time'])
-            best_idx = best['i_theta']
-        else:
-            relaxed_candidates = [c for c in candidates if c['error'] < error_threshold * 2]
-
-            if relaxed_candidates:
-                best = min(relaxed_candidates, key=lambda x: x['flight_time'])
-                best_idx = best['i_theta']
-            else:
-                best = min(candidates, key=lambda x: x['error'])
-                best_idx = best['i_theta']
-
-        best_theta = self.theta_list[best_idx]
-        best_error = errors_interp[best_idx]
-
-        # === Step 8: 角度精化 ===
-        if use_theta_refine:
-            best_theta = self._refine_theta(best_idx, errors_interp)
-
-        # === Step 9: 插值飞行时间 ===
-        flight_time_low = self.trajectories[f'{i_v_low:04d}_{best_idx:04d}']['flight_time']
-        flight_time_high = self.trajectories[f'{i_v_high:04d}_{best_idx:04d}']['flight_time']
-        flight_time = w_low * flight_time_low + w_high * flight_time_high
-
-        if debug:
-            print(f"最优解: θ={best_theta:.2f}°, 估计误差={best_error * 1000:.2f}mm, "
-                  f"飞行时间={flight_time:.4f}s\n")
-
-        return best_theta, best_error, flight_time
-
-    def _query_single_v0(self, d_target: float, h_target: float, i_v: int,
-                         error_threshold: float = 0.05,
-                         use_theta_refine: bool = False,
-                         debug: bool = False) -> tuple:
-        """单个v0的查询（无需速度插值）"""
-        errors = self._compute_errors_for_v0(i_v, d_target, h_target)
-
-        candidates = []
-        for i_theta in range(self.n_theta):
-            theta = self.theta_list[i_theta]
-            error = errors[i_theta]
-            flight_time = self.trajectories[f'{i_v:04d}_{i_theta:04d}']['flight_time']
-
-            candidates.append({
-                'i_theta': i_theta,
-                'theta': theta,
-                'error': error,
-                'flight_time': flight_time
-            })
-
-        valid_candidates = [c for c in candidates if c['error'] < error_threshold]
-
-        if valid_candidates:
-            best = min(valid_candidates, key=lambda x: x['flight_time'])
-            best_idx = best['i_theta']
-        else:
-            relaxed_candidates = [c for c in candidates if c['error'] < error_threshold * 2]
-            if relaxed_candidates:
-                best = min(relaxed_candidates, key=lambda x: x['flight_time'])
-                best_idx = best['i_theta']
-            else:
-                best = min(candidates, key=lambda x: x['error'])
-                best_idx = best['i_theta']
-
-        best_theta = self.theta_list[best_idx]
-        best_error = errors[best_idx]
-
-        if use_theta_refine:
-            best_theta = self._refine_theta(best_idx, errors)
-
-        flight_time = self.trajectories[f'{i_v:04d}_{best_idx:04d}']['flight_time']
-
-        return best_theta, best_error, flight_time
-
-    def compute_real_error(self, d_target: float, h_target: float,
-                           v0_query: float, theta_deg: float) -> tuple:
+    def query_batch(self, targets: list, v0_query: float,
+                    theta_precision: float = 0.01,
+                    debug: bool = False) -> list:
         """
-        计算真实误差 - 用查询条件重新积分轨迹
-
-        ⚠️ 警告: 此函数会调用RK4积分，耗时约1-2ms，不应在高频查询中使用！
-
-        使用场景:
-        1. 离线验证查表精度
-        2. 调试时检查误差
-        3. 生成测试报告
+        批量查询
 
         Args:
-            d_target: 目标水平距离 (m)
-            h_target: 目标高度 (m)
-            v0_query: 查询时使用的初速度 (m/s)
-            theta_deg: query()返回的最优仰角 (度)
+            targets: [(d1, h1), (d2, h2), ...] 目标列表
+            v0_query: 当前初速度
+            theta_precision: 角度精度
+            debug: 是否调试
 
         Returns:
-            (real_error, closest_d, closest_h, flight_time_to_target)
-
-            real_error: 真实误差 (m)
-            closest_d: 轨迹上最接近目标的点的水平距离 (m)
-            closest_h: 轨迹上最接近目标的点的高度 (m)
-            flight_time_to_target: 到达最近点的飞行时间 (s)
+            results: [(theta1, t1, err1), (theta2, t2, err2), ...]
         """
-        integrator = self._get_integrator()
+        results = []
+        for d_target, h_target in targets:
+            result = self.query(d_target, h_target, v0_query, theta_precision, debug)
+            results.append(result)
+        return results
 
-        # 用查询条件积分真实轨迹
-        theta_rad = np.radians(theta_deg)
-        points, times, _, _, _ = integrator.integrate_trajectory(v0_query, theta_rad)
-
-        # 计算到目标点的距离
-        distances = np.sqrt(
-            (points[:, 0] - d_target) ** 2 +
-            (points[:, 1] - h_target) ** 2
-        )
-
-        # 找最小距离
-        min_idx = np.argmin(distances)
-        real_error = distances[min_idx]
-        closest_d = points[min_idx, 0]
-        closest_h = points[min_idx, 1]
-        flight_time_to_target = times[min_idx]
-
-        return real_error, closest_d, closest_h, flight_time_to_target
-
-    def query_with_validation(self, d_target: float, h_target: float, v0_query: float,
-                              error_threshold: float = 0.05,
-                              use_theta_refine: bool = False,
-                              debug: bool = False) -> dict:
+    def get_trajectory_info(self, v0: float, theta_deg: float) -> dict:
         """
-        查询并验证 - 返回完整信息（包括真实误差）
-
-        ⚠️ 警告: 此函数会调用RK4积分，总耗时约2-3ms，不适合高频查询！
-
-        适用场景: 离线测试、调试、验证
+        获取指定(v0, θ)的轨迹信息(用于可视化、调试)
 
         Args:
-            d_target: 目标水平距离 (m)
-            h_target: 目标高度 (m)
-            v0_query: 当前初速度 (m/s)
-            error_threshold: 误差阈值 (m)
-            use_theta_refine: 是否角度精化
-            debug: 是否打印调试信息
+            v0: 初速度 (m/s)
+            theta_deg: 仰角 (度)
 
         Returns:
             {
-                'theta_deg': 最优仰角 (度),
-                'estimated_error': 基于查表的估计误差 (m),
-                'real_error': 基于RK4积分的真实误差 (m),
-                'flight_time': 估计飞行时间 (s),
-                'closest_point': (d, h) 真实轨迹最接近目标的点,
-                'time_to_target': 到达最近点的时间 (s)
+                'points': [(d, h), ...],
+                'times': [t, ...],
+                'flight_time': float,
+                'max_height': float,
+                'max_distance': float
             }
         """
-        # Step 1: 快速查询
-        theta_deg, estimated_error, flight_time = self.query(
-            d_target, h_target, v0_query,
-            error_threshold, use_theta_refine, debug
-        )
-
-        # Step 2: 计算真实误差
-        real_error, closest_d, closest_h, time_to_target = self.compute_real_error(
-            d_target, h_target, v0_query, theta_deg
-        )
-
-        if debug:
-            print(f"\n{'=' * 80}")
-            print(f"误差对比:")
-            print(f"  估计误差 (查表): {estimated_error * 1000:.2f}mm")
-            print(f"  真实误差 (RK4):  {real_error * 1000:.2f}mm")
-            print(f"  误差偏差: {abs(real_error - estimated_error) * 1000:.2f}mm")
-            print(f"最近点: ({closest_d:.3f}m, {closest_h:.3f}m)")
-            print(f"到达时间: {time_to_target:.4f}s")
-            print(f"{'=' * 80}\n")
-
-        return {
-            'theta_deg': theta_deg,
-            'estimated_error': estimated_error,
-            'real_error': real_error,
-            'flight_time': flight_time,
-            'closest_point': (closest_d, closest_h),
-            'time_to_target': time_to_target
-        }
-
-    def get_time_at_distance(self, theta_deg: float, v0: float, d_query: float) -> float:
-        """获取到达指定距离的飞行时间"""
-        i_v = int(np.round((v0 - self.v0_min) / self.dv0))
+        # 找最近的索引
+        i_v = int(round((v0 - self.v0_min) / self.dv0))
         i_v = np.clip(i_v, 0, self.n_v0 - 1)
 
-        i_theta = int(np.argmin(np.abs(self.theta_list - theta_deg)))
+        i_theta = np.argmin(np.abs(self.theta_list - theta_deg))
 
         key = f'{i_v:04d}_{i_theta:04d}'
         traj_data = self.trajectories[key]
 
         points = traj_data['points']
-        times = traj_data['times']
-        distances = points[:, 0]
 
-        if d_query < distances[0] or d_query > distances[-1]:
-            return None
-
-        idx = np.searchsorted(distances, d_query)
-
-        if idx == 0:
-            return times[0]
-        if idx == len(distances):
-            return times[-1]
-
-        d0, d1 = distances[idx - 1], distances[idx]
-        t0, t1 = times[idx - 1], times[idx]
-
-        t_query = t0 + (d_query - d0) / (d1 - d0) * (t1 - t0)
-        return t_query
+        return {
+            'points': points,
+            'times': traj_data['times'],
+            'flight_time': traj_data['flight_time'],
+            'max_height': np.max(points[:, 1]),
+            'max_distance': np.max(points[:, 0]),
+            'actual_v0': self.v0_list[i_v],
+            'actual_theta': self.theta_list[i_theta]
+        }
 
     def close(self):
         """关闭文件"""

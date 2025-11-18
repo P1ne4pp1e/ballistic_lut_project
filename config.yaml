@@ -15,13 +15,13 @@ lut:
   dv0: 0.1
 
   # 角度参数：theta_min° ~ theta_max°，间隔 dtheta°
-  theta_min: -30.0
-  theta_max: 30.0
+  theta_min: -60.0
+  theta_max: 60.0
   dtheta: 0.1
 
   # 数值求解参数
-  dt: 0.0001          # RK4时间步长 (s)
-  max_time: 0.5       # 最大飞行时间 (s)
+  dt: 0.001          # RK4时间步长 (s)
+  max_time: 1.0       # 最大飞行时间 (s)
   distance_sample_interval: 0.01  # 采样点间隔 (m)
 
 storage:
