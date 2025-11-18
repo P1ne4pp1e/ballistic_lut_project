@@ -93,9 +93,9 @@ def test_accuracy_validation():
         v0_query = float(np.random.choice(v0_candidates))
 
         # === 查询 ===
-        t0 = time.time()
+        t0 = time.time_ns()
         theta_deg, flight_time_lut, error_mm = lut.query(d_target, h_target, v0_query)
-        query_time = (time.time() - t0) * 1000
+        query_time = (time.time_ns() - t0) * (1e-6)
 
         # === 用查询结果积分真实轨迹 ===
         theta_rad = np.radians(theta_deg)
@@ -122,7 +122,7 @@ def test_accuracy_validation():
 
         print(f"{i + 1:<5} {d_target:<8.3f} {h_target:<8.3f} {v0_query:<7.1f} {theta_deg:<10.2f} "
               f"{real_error_mm:<12.2f} {flight_time_lut * 1000:<12.2f} {times[min_index] * 1000:<12.2f} "
-              f"{time_error_ms:<10.3f} {query_time:<10.2f}")
+              f"{time_error_ms:<10.3f} {query_time:<10.3  f}")
 
     # 转换为numpy数组
     position_errors_query = np.array(position_errors_query)
