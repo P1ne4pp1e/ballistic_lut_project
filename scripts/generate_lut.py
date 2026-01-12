@@ -26,7 +26,7 @@ def main():
     print(f"\n{lut_config}")
 
     # 使用绝对路径
-    save_path = project_root / 'data' / 'trajectory_lut_full.h5'
+    save_path = project_root / 'data' / 'trajectory_lut.h5'
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"\n保存路径: {save_path.absolute()}")

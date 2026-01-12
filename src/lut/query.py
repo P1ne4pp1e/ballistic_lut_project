@@ -1,24 +1,20 @@
 """
-优化版查询算法 - 三分法找峰 + 二分法找零点
+优化版查询算法 - 三分法找峰 + 二分法找零点 (带有效角度过滤)
 
-核心思路:
-1. 三分法找error最大值(凸峰或边界)
-2. 在左侧上升沿二分找零点
+核心改进:
+1. 预先过滤无效角度(超时返回None的角度)
+2. 在有效角度范围内执行三分+二分
 3. 线性插值得到精确角度
-
-适用于所有曲线:
-- 凸曲线: 找到内部峰值
-- 单调曲线: 收敛到边界 (也是正确的)
 
 性能: O(log n) ≈ 10-15次查询
 """
 
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 
 class TrajectoryLUT:
-    """查表查询引擎 - 三分+二分优化版"""
+    """查表查询引擎 - 三分+二分优化版 (带有效角度过滤)"""
 
     def __init__(self, lut_path: str = '../data/trajectory_lut_full.h5'):
         import h5py
@@ -85,7 +81,7 @@ class TrajectoryLUT:
 
     def _get_error_at_theta(self, i_v: int, i_theta: int,
                             d_target: float, h_target: float) -> Optional[float]:
-        """获取指定角度下的高度误差 (返回None表示超出射程)"""
+        """获取指定角度下的高度误差 (返回None表示超出射程或超时)"""
         key = f'{i_v:04d}_{i_theta:04d}'
         points = self.trajectories[key]['points']
 
@@ -95,68 +91,90 @@ class TrajectoryLUT:
         except ValueError:
             return None
 
+    def _get_valid_theta_indices(self, i_v: int, d_target: float, h_target: float) -> List[int]:
+        """
+        获取有效角度索引列表 (过滤掉返回None的角度)
+
+        Returns:
+            valid_indices: 有效角度的索引列表
+        """
+        valid_indices = []
+        for i_theta in range(self.n_theta):
+            err = self._get_error_at_theta(i_v, i_theta, d_target, h_target)
+            if err is not None:
+                valid_indices.append(i_theta)
+        return valid_indices
+
     def _ternary_search_peak(self, i_v: int, d_target: float, h_target: float,
-                             left: int, right: int) -> int:
+                             valid_indices: List[int]) -> Tuple[int, int]:
         """
-        三分法找error最大值
+        三分法找error最大值 (仅在有效角度范围内)
 
-        适用于:
-        - 凸曲线: 找到内部峰值
-        - 单调递增: 收敛到right (最大值在右边界)
-        - 单调递减: 收敛到left (最大值在左边界)
+        Args:
+            valid_indices: 有效角度索引列表
 
-        复杂度: O(log n)
+        Returns:
+            (peak_index_in_valid, iter_count): 峰值在valid_indices中的位置和迭代次数
         """
+        if not valid_indices:
+            raise ValueError("没有有效角度")
+
+        left, right = 0, len(valid_indices) - 1
         iter_count = 0
 
-        while right - left > 2:  # 收敛阈值: 3个点以内
+        while right - left > 2:
             iter_count += 1
 
             mid1 = left + (right - left) // 3
             mid2 = right - (right - left) // 3
 
-            err1 = self._get_error_at_theta(i_v, mid1, d_target, h_target)
-            err2 = self._get_error_at_theta(i_v, mid2, d_target, h_target)
+            i_theta1 = valid_indices[mid1]
+            i_theta2 = valid_indices[mid2]
 
-            # 处理超出射程的情况
-            if err1 is None:
-                err1 = -np.inf
-            if err2 is None:
-                err2 = -np.inf
+            err1 = self._get_error_at_theta(i_v, i_theta1, d_target, h_target)
+            err2 = self._get_error_at_theta(i_v, i_theta2, d_target, h_target)
 
-            # 三分逻辑: 抛弃较小的一侧
             if err1 < err2:
-                left = mid1  # 峰值在右侧
+                left = mid1
             else:
-                right = mid2  # 峰值在左侧
+                right = mid2
 
         # 在最后3个点中找最大error
         max_err = -np.inf
         peak_idx = left
 
         for i in range(left, right + 1):
-            err = self._get_error_at_theta(i_v, i, d_target, h_target)
-            if err is not None and err > max_err:
+            i_theta = valid_indices[i]
+            err = self._get_error_at_theta(i_v, i_theta, d_target, h_target)
+            if err > max_err:
                 max_err = err
                 peak_idx = i
 
         return peak_idx, iter_count
 
     def _binary_search_zero(self, i_v: int, d_target: float, h_target: float,
-                            left: int, right: int) -> Optional[Tuple[int, int, int]]:
+                            valid_indices: List[int], left: int, right: int,
+                            debug: bool = False) -> Optional[Tuple[int, int, int]]:
         """
-        二分法查找零点 (在上升段)
+        二分法查找零点 (在有效角度的上升段)
+
+        Args:
+            valid_indices: 有效角度索引列表
+            left, right: 在valid_indices中的索引范围
 
         Returns:
-            (i_prev, i_curr, iter_count): 零点所在区间和迭代次数
+            (i_prev, i_curr, iter_count): 零点所在区间(在valid_indices中的索引)和迭代次数
             None: 未找到零点
         """
-        # 边界检查
-        err_left = self._get_error_at_theta(i_v, left, d_target, h_target)
-        err_right = self._get_error_at_theta(i_v, right, d_target, h_target)
+        i_theta_left = valid_indices[left]
+        i_theta_right = valid_indices[right]
 
-        if err_left is None or err_right is None:
-            return None
+        err_left = self._get_error_at_theta(i_v, i_theta_left, d_target, h_target)
+        err_right = self._get_error_at_theta(i_v, i_theta_right, d_target, h_target)
+
+        if debug:
+            print(f"  left={left}(θ={self.theta_list[i_theta_left]:.1f}°), err={err_left*1000:.1f}mm")
+            print(f"  right={right}(θ={self.theta_list[i_theta_right]:.1f}°), err={err_right*1000:.1f}mm")
 
         # 检查是否有零点
         if err_left * err_right > 0:
@@ -167,16 +185,12 @@ class TrajectoryLUT:
         while right - left > 1:
             iter_count += 1
             mid = (left + right) // 2
-            err_mid = self._get_error_at_theta(i_v, mid, d_target, h_target)
-
-            if err_mid is None:
-                right = mid - 1
-                continue
+            i_theta_mid = valid_indices[mid]
+            err_mid = self._get_error_at_theta(i_v, i_theta_mid, d_target, h_target)
 
             if abs(err_mid) < 1e-6:
                 return (mid, mid, iter_count)
 
-            # 根据符号调整边界
             if err_mid * err_left < 0:
                 right = mid
                 err_right = err_mid
@@ -189,14 +203,13 @@ class TrajectoryLUT:
     def query(self, d_target: float, h_target: float, v0_query: float,
               theta_precision: float = 0.01, debug: bool = False) -> tuple:
         """
-        查询最优仰角 - 三分+二分优化版
+        查询最优仰角 - 三分+二分优化版 (带有效角度过滤)
 
         算法流程:
-        1. 三分法找error峰值 O(log n)
-        2. 在左侧上升沿二分找零点 O(log n)
-        3. 线性插值精确角度 O(1)
-
-        总复杂度: O(log n) ≈ 10-15次查询
+        1. 过滤无效角度(超时/超出射程) O(n)
+        2. 在有效角度内三分法找峰值 O(log m)
+        3. 在左侧上升沿二分找零点 O(log m)
+        4. 线性插值精确角度 O(1)
 
         Args:
             d_target: 目标水平距离 (m)
@@ -217,21 +230,32 @@ class TrajectoryLUT:
             print(f"查询: d={d_target:.3f}m, h={h_target:.3f}m, v0={v0_query:.1f}m/s")
             print(f"{'=' * 80}")
 
-        # Step 2: 三分法找峰值
-        left, right = 0, self.n_theta - 1
-        peak_idx, ternary_iters = self._ternary_search_peak(
-            i_v, d_target, h_target, left, right
-        )
+        # Step 2: 获取有效角度范围
+        valid_indices = self._get_valid_theta_indices(i_v, d_target, h_target)
+
+        if not valid_indices:
+            raise ValueError(f"目标(d={d_target:.3f}m, h={h_target:.3f}m)无法到达")
 
         if debug:
-            peak_theta = self.theta_list[peak_idx]
-            peak_err = self._get_error_at_theta(i_v, peak_idx, d_target, h_target)
+            valid_thetas = [self.theta_list[i] for i in valid_indices]
+            print(f"有效角度: {len(valid_indices)}个 ({valid_thetas[0]:.1f}°~{valid_thetas[-1]:.1f}°)")
+
+        # Step 3: 在有效角度内三分法找峰值
+        peak_idx_in_valid, ternary_iters = self._ternary_search_peak(
+            i_v, d_target, h_target, valid_indices
+        )
+
+        peak_i_theta = valid_indices[peak_idx_in_valid]
+
+        if debug:
+            peak_theta = self.theta_list[peak_i_theta]
+            peak_err = self._get_error_at_theta(i_v, peak_i_theta, d_target, h_target)
             print(f"三分法: {ternary_iters}次迭代")
             print(f"  峰值: θ={peak_theta:.1f}°, err={peak_err * 1000:.1f}mm")
 
-        # Step 3: 在左侧上升沿二分找零点
+        # Step 4: 在左侧上升沿二分找零点
         zero_result = self._binary_search_zero(
-            i_v, d_target, h_target, left, peak_idx
+            i_v, d_target, h_target, valid_indices, 0, peak_idx_in_valid, debug
         )
 
         if zero_result is None:
@@ -239,12 +263,12 @@ class TrajectoryLUT:
             if debug:
                 print("⚠️  未找到零点,使用峰值点")
 
-            theta_best = self.theta_list[peak_idx]
-            key_best = f'{i_v:04d}_{peak_idx:04d}'
+            theta_best = self.theta_list[peak_i_theta]
+            key_best = f'{i_v:04d}_{peak_i_theta:04d}'
             t_best = self.trajectories[key_best]['flight_time']
 
-            peak_err = self._get_error_at_theta(i_v, peak_idx, d_target, h_target)
-            error_mm = abs(peak_err) * 1000 if peak_err is not None else 999.0
+            peak_err = self._get_error_at_theta(i_v, peak_i_theta, d_target, h_target)
+            error_mm = abs(peak_err) * 1000
 
             if debug:
                 print(f"结果: θ={theta_best:.2f}°, err={error_mm:.1f}mm")
@@ -252,8 +276,11 @@ class TrajectoryLUT:
 
             return theta_best, t_best, error_mm
 
-        # Step 4: 线性插值精确零点
-        i_prev, i_curr, binary_iters = zero_result
+        # Step 5: 线性插值精确零点
+        i_prev_in_valid, i_curr_in_valid, binary_iters = zero_result
+
+        i_prev = valid_indices[i_prev_in_valid]
+        i_curr = valid_indices[i_curr_in_valid]
 
         if debug:
             print(f"二分法: {binary_iters}次迭代")
@@ -349,7 +376,7 @@ if __name__ == '__main__':
     import time
 
     print("\n" + "=" * 80)
-    print("三分+二分优化算法测试")
+    print("三分+二分优化算法测试 (带有效角度过滤)")
     print("=" * 80 + "\n")
 
     lut = TrajectoryLUT('../data/trajectory_lut_full.h5')

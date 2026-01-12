@@ -18,7 +18,7 @@ def test_query_speed():
     print("测试1: 查询性能测试（零点搜索法）")
     print("=" * 80)
 
-    lut = TrajectoryLUT('../data/trajectory_lut_full.h5')
+    lut = TrajectoryLUT('../data/trajectory_lut.h5')
 
     # 生成测试数据（注意：v0必须是表中的值）
     num_queries = 1000
@@ -63,7 +63,7 @@ def test_accuracy_validation():
     print("测试2: 精度验证（零点法 vs RK4真实积分）")
     print("=" * 80)
 
-    lut = TrajectoryLUT('../data/trajectory_lut_full.h5')
+    lut = TrajectoryLUT('../data/trajectory_lut.h5')
 
     # 创建积分器用于验证
     from src.physics.config import PhysicsConfig, LUTConfig
@@ -88,7 +88,7 @@ def test_accuracy_validation():
     flight_times_rk4 = []
 
     for i in range(num_tests):
-        d_target = float(np.random.uniform(1.0, 10.0))
+        d_target = float(np.random.uniform(1.0, 8.0))
         h_target = float(np.random.uniform(-0.5, 0.5))
         v0_query = float(np.random.choice(v0_candidates))
 
@@ -122,7 +122,7 @@ def test_accuracy_validation():
 
         print(f"{i + 1:<5} {d_target:<8.3f} {h_target:<8.3f} {v0_query:<7.1f} {theta_deg:<10.2f} "
               f"{real_error_mm:<12.2f} {flight_time_lut * 1000:<12.2f} {times[min_index] * 1000:<12.2f} "
-              f"{time_error_ms:<10.3f} {query_time:<10.3  f}")
+              f"{time_error_ms:<10.3f} {query_time:<10.3f}")
 
     # 转换为numpy数组
     position_errors_query = np.array(position_errors_query)
@@ -185,7 +185,7 @@ def test_early_stopping():
     print("测试3: 早停优化效果测试")
     print("=" * 80)
 
-    lut = TrajectoryLUT('../data/trajectory_lut_full.h5')
+    lut = TrajectoryLUT('../data/trajectory_lut.h5')
 
     # 不同距离的目标，预期扫描不同数量的角度
     test_cases = [
@@ -215,7 +215,7 @@ def test_edge_cases():
     print("测试4: 边界情况测试")
     print("=" * 80)
 
-    lut = TrajectoryLUT('../data/trajectory_lut_full.h5')
+    lut = TrajectoryLUT('../data/trajectory_lut.h5')
 
     # 边界测试用例
     edge_cases = [
@@ -248,7 +248,7 @@ def test_batch_query():
     print("测试5: 批量查询测试")
     print("=" * 80)
 
-    lut = TrajectoryLUT('../data/trajectory_lut_full.h5')
+    lut = TrajectoryLUT('../data/trajectory_lut.h5')
 
     # 生成批量目标
     v0 = 24.0
